@@ -1,10 +1,6 @@
 import * as THREE from 'three';
 import { useEffect, useRef, useState } from 'react';
 
-/**
- * UV bounds for the portrait area on the card texture atlas (kartu.glb).
- * Derived from mesh TEXCOORD_0 analysis — only this region is replaced.
- */
 export const PHOTO_UV_REGION = {
   uMin: 0.010906517505645752,
   uMax: 0.4888157248497009,
@@ -23,17 +19,10 @@ function uvRegionToPixels(region, width, height) {
   };
 }
 
-/**
- * Draw image with object-fit: cover into destination rect (centered crop, no stretch).
- */
 function drawCoverImage(ctx, image, dx, dy, dw, dh) {
   const imgRatio = image.width / image.height;
   const boxRatio = dw / dh;
-
-  let sx;
-  let sy;
-  let sw;
-  let sh;
+  let sx, sy, sw, sh;
 
   if (imgRatio > boxRatio) {
     sh = image.height;
@@ -50,9 +39,6 @@ function drawCoverImage(ctx, image, dx, dy, dw, dh) {
   ctx.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
 }
 
-/**
- * Load pp.png fresh on each mount (avoids stale drei/browser cache during dev).
- */
 export function useProfileImage() {
   const [image, setImage] = useState(null);
 
@@ -60,12 +46,8 @@ export function useProfileImage() {
     let cancelled = false;
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      if (!cancelled) setImage(img);
-    };
-    img.onerror = () => {
-      if (!cancelled) setImage(null);
-    };
+    img.onload = () => { if (!cancelled) setImage(img); };
+    img.onerror = () => { if (!cancelled) setImage(null); };
     img.src = `${PROFILE_TEXTURE_PATH}?v=${Date.now()}`;
 
     return () => {
@@ -79,9 +61,47 @@ export function useProfileImage() {
 }
 
 /**
- * Composites pp.png over the portrait slot of the embedded card atlas.
- * Preserves frame, background pattern, name label, and all other atlas regions.
+ * Resolves baseMaterial.map.image to a drawable source.
+ * In production, Three.js may give us an ImageBitmap with width=0.
+ * We force-draw it onto a temp canvas to get a reliable HTMLImageElement.
  */
+function resolveDrawableImage(source) {
+  return new Promise((resolve, reject) => {
+    if (!source) return reject(new Error('No source'));
+
+    // Already a usable HTMLImageElement
+    if (source instanceof HTMLImageElement && source.complete && source.naturalWidth > 0) {
+      return resolve(source);
+    }
+
+    // ImageBitmap — draw to canvas, export as blob, reload as Image
+    if (typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap) {
+      if (source.width === 0) return reject(new Error('ImageBitmap width is 0'));
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = source.width;
+      offscreen.height = source.height;
+      const ctx = offscreen.getContext('2d');
+      ctx.drawImage(source, 0, 0);
+
+      offscreen.toBlob((blob) => {
+        if (!blob) return reject(new Error('toBlob failed'));
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('img load failed')); };
+        img.src = url;
+      });
+      return;
+    }
+
+    // HTMLVideoElement, HTMLCanvasElement, or other drawable — use directly
+    if (source.width > 0) return resolve(source);
+
+    reject(new Error('Unresolvable source'));
+  });
+}
+
 export function useCompositedCardMap(baseMaterial, profileImage) {
   const [compositedMap, setCompositedMap] = useState(null);
   const canvasRef = useRef(null);
@@ -89,56 +109,63 @@ export function useCompositedCardMap(baseMaterial, profileImage) {
 
   useEffect(() => {
     const baseImage = baseMaterial?.map?.image;
+    if (!baseImage || !profileImage?.width) return;
 
-    if (!baseImage?.width || !profileImage?.width) return;
+    let cancelled = false;
 
-    const width = baseImage.width;
-    const height = baseImage.height;
+    resolveDrawableImage(baseImage)
+      .then((resolvedBase) => {
+        if (cancelled) return;
 
-    if (!canvasRef.current) {
-      canvasRef.current = document.createElement('canvas');
-    }
+        const width = resolvedBase.width || resolvedBase.naturalWidth;
+        const height = resolvedBase.height || resolvedBase.naturalHeight;
+        if (!width || !height) return;
 
-    const canvas = canvasRef.current;
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
+        if (!canvasRef.current) {
+          canvasRef.current = document.createElement('canvas');
+        }
 
-    const composite = () => {
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(baseImage, 0, 0, width, height);
+        const canvas = canvasRef.current;
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
 
-      const rect = uvRegionToPixels(PHOTO_UV_REGION, width, height);
-      const radius = Math.min(rect.width, rect.height) * 0.085;
+        ctx.clearRect(0, 0, width, height);
+        ctx.drawImage(resolvedBase, 0, 0, width, height);
 
-      ctx.save();
-      ctx.beginPath();
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(rect.x, rect.y, rect.width, rect.height, radius);
-      } else {
-        ctx.rect(rect.x, rect.y, rect.width, rect.height);
-      }
-      ctx.clip();
-      drawCoverImage(ctx, profileImage, rect.x, rect.y, rect.width, rect.height);
-      ctx.restore();
+        const rect = uvRegionToPixels(PHOTO_UV_REGION, width, height);
+        const radius = Math.min(rect.width, rect.height) * 0.085;
 
-      if (!textureRef.current) {
-        const tex = new THREE.CanvasTexture(canvas);
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.flipY = false;
-        tex.minFilter = THREE.LinearMipmapLinearFilter;
-        tex.magFilter = THREE.LinearFilter;
-        tex.generateMipmaps = true;
-        textureRef.current = tex;
-      }
+        ctx.save();
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(rect.x, rect.y, rect.width, rect.height, radius);
+        } else {
+          ctx.rect(rect.x, rect.y, rect.width, rect.height);
+        }
+        ctx.clip();
+        drawCoverImage(ctx, profileImage, rect.x, rect.y, rect.width, rect.height);
+        ctx.restore();
 
-      textureRef.current.needsUpdate = true;
-      setCompositedMap(textureRef.current);
-    };
+        if (!textureRef.current) {
+          const tex = new THREE.CanvasTexture(canvas);
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.flipY = false;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.generateMipmaps = true;
+          textureRef.current = tex;
+        }
 
-    composite();
+        textureRef.current.needsUpdate = true;
+        setCompositedMap(textureRef.current);
+      })
+      .catch((err) => {
+        console.warn('[CardCompositor] Could not resolve base image:', err.message);
+      });
 
     return () => {
+      cancelled = true;
       textureRef.current?.dispose();
       textureRef.current = null;
     };
